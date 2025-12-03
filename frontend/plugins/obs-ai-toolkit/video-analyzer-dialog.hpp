@@ -6,8 +6,6 @@
 #pragma once
 
 #include <QDialog>
-#include <QMediaPlayer>
-#include <QVideoWidget>
 #include <QSlider>
 #include <QLabel>
 #include <QPushButton>
@@ -23,6 +21,9 @@
 #include <vector>
 #include <string>
 #include <utility>
+
+/* Forward declaration */
+class FFmpegVideoPlayer;
 
 /* Timeline widget with waveform and selection */
 class VideoTimeline : public QWidget {
@@ -165,15 +166,20 @@ private:
 	void populateTranscript();
 	void onExportJSON();
 	void onExportCSV();
-	void onExportYouTube();
+	void onExportYouTubeAI();
 	void loadWaveform(const QString &videoPath);
 	void cutSelectedTranscriptSegment();
 	int getTranscriptSegmentAtCursor();
 	std::pair<int, int> getSelectedTranscriptRange();
+	
+	/* Search functionality */
+	void onSearchTextChanged(const QString &text);
+	void onSearchNext();
+	void onSearchPrev();
+	void highlightSearchResults();
+	void jumpToSearchResult(int index);
 
-	/* Video player */
-	QMediaPlayer *mediaPlayer = nullptr;
-	QVideoWidget *videoWidget = nullptr;
+	FFmpegVideoPlayer *videoPlayer = nullptr;
 	QScrollArea *timelineScroll = nullptr;
 	VideoTimeline *timeline = nullptr;
 	QPushButton *playPauseButton = nullptr;
@@ -189,6 +195,9 @@ private:
 	QPushButton *clearSelectionButton = nullptr;
 	QPushButton *undoCutButton = nullptr;
 	QPushButton *saveEditedButton = nullptr;
+	
+	bool updatingTranscript = false;
+	qint64 skipTargetPosition = 0;
 
 	/* File selection */
 	QLineEdit *videoPathEdit = nullptr;
@@ -203,6 +212,15 @@ private:
 
 	/* Results */
 	QTextEdit *transcriptView = nullptr;
+	
+	/* Search */
+	QLineEdit *searchEdit = nullptr;
+	QPushButton *searchPrevButton = nullptr;
+	QPushButton *searchNextButton = nullptr;
+	QLabel *searchResultsLabel = nullptr;
+	std::vector<int> searchMatchIndices; /* Indices of matching transcript segments */
+	int currentSearchIndex = -1;
+	QString currentSearchQuery;
 	
 	/* Export */
 	QComboBox *exportFormatCombo = nullptr;

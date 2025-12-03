@@ -1,8 +1,14 @@
 /*
  * Combined Video Analyzer Dialog Implementation
+ * Standalone version using native FFmpeg and whisper.cpp
+ * No Qt Multimedia plugins required - uses FFmpeg directly for video playback
  */
 
 #include "video-analyzer-dialog.hpp"
+#include "video-player.hpp"
+#include "ffmpeg-utils.hpp"
+#include "whisper-utils.hpp"
+#include "llama-runner.hpp"
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -18,14 +24,19 @@
 #include <QFile>
 #include <QTextStream>
 #include <QMainWindow>
-#include <QProcess>
 #include <QDir>
 #include <QPainter>
 #include <QMouseEvent>
 #include <QStyle>
-#include <QAudioOutput>
+#include <QClipboard>
 #include <QScrollBar>
 #include <QScrollArea>
+#include <QProcess>
+#include <QThread>
+#include <QtConcurrent/QtConcurrent>
+#include <QFutureWatcher>
+#include <QApplication>
+#include <algorithm>
 
 /* ========================================================================== */
 /* Video Timeline Widget                                                       */
@@ -489,140 +500,58 @@ void VideoAnalysisWorker::process()
 
 void VideoAnalysisWorker::runTranscription()
 {
-	QString tempDir = QDir::tempPath();
-	QString scriptPath = tempDir + "/obs_video_transcribe.py";
-	QString outputPath = tempDir + "/obs_video_transcript.json";
-
-	QFile scriptFile(scriptPath);
-	if (!scriptFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-		emit analysisError("Could not create transcription script");
-		return;
-	}
-
-	QString pythonScript = R"PYTHON(
-import sys
-import os
-import json
-
-os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
-
-try:
-    import whisper
-except ImportError:
-    print("ERROR: whisper not installed", file=sys.stderr)
-    sys.exit(1)
-
-video_path = sys.argv[1]
-output_path = sys.argv[2]
-model_name = sys.argv[3] if len(sys.argv) > 3 else "base"
-language = sys.argv[4] if len(sys.argv) > 4 else "en"
-
-print(f"Loading model: {model_name}", file=sys.stderr)
-model = whisper.load_model(model_name)
-
-print(f"Transcribing...", file=sys.stderr)
-lang_param = None if language == "auto" else language
-
-# Use word_timestamps for accurate timing
-# condition_on_previous_text=False prevents hallucination and improves timing accuracy
-result = model.transcribe(
-    video_path, 
-    language=lang_param, 
-    verbose=False,
-    word_timestamps=True,
-    condition_on_previous_text=False
-)
-
-segments = []
-for seg in result.get("segments", []):
-    # Use the actual segment timing from Whisper
-    # These should reflect real audio timestamps, not normalized ones
-    start_time = seg["start"]
-    end_time = seg["end"]
-    
-    # If word-level timestamps are available and more accurate, use them
-    words = seg.get("words", [])
-    if words and len(words) > 0:
-        # Word timestamps are more precise
-        first_word = words[0]
-        last_word = words[-1]
-        if "start" in first_word and first_word["start"] > 0:
-            start_time = first_word["start"]
-        if "end" in last_word:
-            end_time = last_word["end"]
-    
-    # Only add segment if it has actual content
-    text = seg["text"].strip()
-    if text:
-        segments.append({
-            "start": start_time,
-            "end": end_time,
-            "text": text
-        })
-
-with open(output_path, "w") as f:
-    json.dump(segments, f)
-
-print(f"Done: {len(segments)} segments", file=sys.stderr)
-)PYTHON";
-
-	QTextStream out(&scriptFile);
-	out << pythonScript;
-	scriptFile.close();
-
-	/* Find Python */
-	QStringList pythonPaths = {
-		QDir::homePath() + "/.venv/main/bin/python",
-		"/opt/homebrew/bin/python3",
-		"/usr/local/bin/python3",
-		"python3"
-	};
-
-	QString pythonPath;
-	for (const QString &path : pythonPaths) {
-		if (QFile::exists(path)) {
-			pythonPath = path;
-			break;
+	/* Check if model is downloaded */
+	if (!WhisperTranscriber::isModelDownloaded(modelName.toStdString())) {
+		emit progressUpdated(0, QString("Downloading %1 model...").arg(modelName));
+		
+		bool downloaded = WhisperTranscriber::downloadModel(
+			modelName.toStdString(),
+			[this](int progress, const std::string &status) {
+				emit progressUpdated(progress / 4, QString::fromStdString(status));
+			}
+		);
+		
+		if (!downloaded) {
+			emit analysisError("Failed to download model. Check your internet connection.");
+			return;
 		}
 	}
-
-	if (pythonPath.isEmpty()) {
-		QFile::remove(scriptPath);
-		emit analysisError("Python not found");
+	
+	/* Create transcriber and load model */
+	WhisperTranscriber transcriber;
+	
+	emit progressUpdated(25, "Loading model...");
+	
+	if (!transcriber.loadModel(modelName.toStdString())) {
+		emit analysisError("Failed to load model: " + modelName);
 		return;
 	}
-
-	QProcess process;
-	process.start(pythonPath, {scriptPath, videoPath, outputPath, modelName, languageCode});
-
-	int progress = 10;
-	while (!process.waitForFinished(2000)) {
-		if (progress < 95) {
-			progress += 5;
-			emit progressUpdated(progress, "Transcribing...");
+	
+	/* Run transcription */
+	WhisperResult result = transcriber.transcribe(
+		videoPath.toStdString(),
+		languageCode.toStdString(),
+		[this](int progress, const std::string &status) {
+			emit progressUpdated(progress, QString::fromStdString(status));
 		}
-	}
-
-	QFile::remove(scriptPath);
-
-	if (process.exitCode() != 0) {
-		emit analysisError("Transcription failed: " + process.readAllStandardError());
+	);
+	
+	if (!result.success) {
+		emit analysisError(QString::fromStdString(result.error));
 		return;
 	}
-
-	QFile outputFile(outputPath);
-	if (!outputFile.open(QIODevice::ReadOnly)) {
-		emit analysisError("Could not read transcription results");
-		return;
+	
+	/* Convert to JSON array for compatibility */
+	QJsonArray segments;
+	for (const auto &seg : result.segments) {
+		QJsonObject obj;
+		obj["start"] = seg.start;
+		obj["end"] = seg.end;
+		obj["text"] = QString::fromStdString(seg.text);
+		segments.append(obj);
 	}
-
-	QJsonDocument doc = QJsonDocument::fromJson(outputFile.readAll());
-	outputFile.close();
-	QFile::remove(outputPath);
-
-	if (doc.isArray()) {
-		emit transcriptionComplete(doc.array());
-	}
+	
+	emit transcriptionComplete(segments);
 }
 
 /* ========================================================================== */
@@ -640,8 +569,8 @@ VideoAnalyzerDialog::VideoAnalyzerDialog(QWidget *parent)
 
 VideoAnalyzerDialog::~VideoAnalyzerDialog()
 {
-	if (mediaPlayer) {
-		mediaPlayer->stop();
+	if (videoPlayer) {
+		videoPlayer->stop();
 	}
 	if (analysisThread) {
 		analysisThread->quit();
@@ -672,10 +601,9 @@ void VideoAnalyzerDialog::setupUI()
 	QVBoxLayout *videoLayout = new QVBoxLayout(videoContainer);
 	videoLayout->setContentsMargins(0, 0, 0, 0);
 
-	/* Video Widget */
-	videoWidget = new QVideoWidget(this);
-	videoWidget->setMinimumSize(480, 270);
-	videoLayout->addWidget(videoWidget, 1);
+	videoPlayer = new FFmpegVideoPlayer(this);
+	videoPlayer->setMinimumSize(480, 270);
+	videoLayout->addWidget(videoPlayer, 1);
 
 	/* Timeline in scroll area */
 	timelineScroll = new QScrollArea(this);
@@ -827,17 +755,61 @@ void VideoAnalyzerDialog::setupUI()
 	exportFormatCombo = new QComboBox(this);
 	exportFormatCombo->addItem("JSON", "json");
 	exportFormatCombo->addItem("CSV", "csv");
-	exportFormatCombo->addItem("YouTube Chapters", "youtube");
-	exportFormatCombo->setFixedWidth(130);
+	exportFormatCombo->addItem("YouTube Chapters", "youtube_ai");
+	exportFormatCombo->setFixedWidth(160);
 	
 	exportButton = new QPushButton("Export", this);
 	exportButton->setEnabled(false);
 	exportButton->setFixedWidth(70);
+	exportButton->setAutoDefault(false);
+	exportButton->setDefault(false);
 	connect(exportButton, &QPushButton::clicked, this, &VideoAnalyzerDialog::onExportClicked);
 	
 	transcriptHeader->addWidget(exportFormatCombo);
 	transcriptHeader->addWidget(exportButton);
 	transcriptContainerLayout->addLayout(transcriptHeader);
+	
+	/* Search bar */
+	QHBoxLayout *searchLayout = new QHBoxLayout();
+	searchLayout->setContentsMargins(0, 4, 0, 4);
+	
+	searchEdit = new QLineEdit(this);
+	searchEdit->setPlaceholderText("Search transcript...");
+	searchEdit->setClearButtonEnabled(true);
+	searchEdit->setStyleSheet(R"(
+		QLineEdit {
+			padding: 6px 10px;
+			border: 1px solid #555;
+			border-radius: 4px;
+			background: #2a2a2a;
+		}
+		QLineEdit:focus {
+			border-color: #0af;
+		}
+	)");
+	connect(searchEdit, &QLineEdit::textChanged, this, &VideoAnalyzerDialog::onSearchTextChanged);
+	connect(searchEdit, &QLineEdit::returnPressed, this, &VideoAnalyzerDialog::onSearchNext);
+	searchLayout->addWidget(searchEdit, 1);
+	
+	searchPrevButton = new QPushButton("◀", this);
+	searchPrevButton->setFixedWidth(40);
+	searchPrevButton->setToolTip("Previous match (Shift+Enter)");
+	searchPrevButton->setEnabled(false);
+	connect(searchPrevButton, &QPushButton::clicked, this, &VideoAnalyzerDialog::onSearchPrev);
+	searchLayout->addWidget(searchPrevButton);
+	
+	searchNextButton = new QPushButton("▶", this);
+	searchNextButton->setFixedWidth(40);
+	searchNextButton->setToolTip("Next match (Enter)");
+	searchNextButton->setEnabled(false);
+	connect(searchNextButton, &QPushButton::clicked, this, &VideoAnalyzerDialog::onSearchNext);
+	searchLayout->addWidget(searchNextButton);
+	
+	searchResultsLabel = new QLabel("", this);
+	searchResultsLabel->setStyleSheet("color: #888; min-width: 60px;");
+	searchLayout->addWidget(searchResultsLabel);
+	
+	transcriptContainerLayout->addLayout(searchLayout);
 
 	transcriptView = new QTextEdit(this);
 	transcriptView->setReadOnly(true);
@@ -861,6 +833,8 @@ void VideoAnalyzerDialog::setupUI()
 	/* Analyze Button at bottom */
 	analyzeButton = new QPushButton(obs_module_text("VideoAnalyzer.Analyze"), this);
 	analyzeButton->setStyleSheet("QPushButton { padding: 10px 20px; font-weight: bold; font-size: 14px; }");
+	analyzeButton->setAutoDefault(false);
+	analyzeButton->setDefault(false);
 	connect(analyzeButton, &QPushButton::clicked, this, &VideoAnalyzerDialog::onAnalyzeClicked);
 	rightLayout->addWidget(analyzeButton);
 
@@ -871,39 +845,22 @@ void VideoAnalyzerDialog::setupUI()
 
 	mainLayout->addWidget(splitter, 1);
 
-	/* Setup Media Player */
-	mediaPlayer = new QMediaPlayer(this);
-	QAudioOutput *audioOutput = new QAudioOutput(this);
-	mediaPlayer->setAudioOutput(audioOutput);
-	mediaPlayer->setVideoOutput(videoWidget);
-
-	connect(mediaPlayer, &QMediaPlayer::positionChanged, this, &VideoAnalyzerDialog::onPositionChanged);
-	connect(mediaPlayer, &QMediaPlayer::durationChanged, this, &VideoAnalyzerDialog::onDurationChanged);
-	connect(mediaPlayer, &QMediaPlayer::playbackStateChanged, [this]() {
+	/* Connect FFmpeg video player signals */
+	connect(videoPlayer, &FFmpegVideoPlayer::positionChanged, this, &VideoAnalyzerDialog::onPositionChanged);
+	connect(videoPlayer, &FFmpegVideoPlayer::durationChanged, this, &VideoAnalyzerDialog::onDurationChanged);
+	connect(videoPlayer, &FFmpegVideoPlayer::playbackStateChanged, [this](bool playing) {
+		Q_UNUSED(playing);
 		updatePlayPauseButton();
 	});
-	connect(mediaPlayer, &QMediaPlayer::mediaStatusChanged, [this](QMediaPlayer::MediaStatus status) {
-		if (status == QMediaPlayer::LoadedMedia) {
-			/* Show first frame when video is loaded */
-			mediaPlayer->setPosition(1);
-			mediaPlayer->pause();
-			statusLabel->setText("Video loaded successfully!");
-		} else if (status == QMediaPlayer::InvalidMedia) {
-			statusLabel->setText("Error: Invalid or unsupported video format");
-		} else if (status == QMediaPlayer::NoMedia) {
-			statusLabel->setText("No video loaded");
-		}
-	});
-	connect(mediaPlayer, &QMediaPlayer::errorOccurred, [this](QMediaPlayer::Error error, const QString &errorString) {
-		Q_UNUSED(error);
-		statusLabel->setText("Error: " + errorString);
-		QMessageBox::warning(this, "Video Error", errorString);
+	connect(videoPlayer, &FFmpegVideoPlayer::errorOccurred, [this](const QString &error) {
+		statusLabel->setText("Error: " + error);
+		QMessageBox::warning(this, "Video Error", error);
 	});
 
-	connect(volumeSlider, &QSlider::valueChanged, [audioOutput](int value) {
-		audioOutput->setVolume(value / 100.0f);
+	connect(volumeSlider, &QSlider::valueChanged, [this](int value) {
+		videoPlayer->setVolume(value / 100.0f);
 	});
-	audioOutput->setVolume(0.7f);
+	videoPlayer->setVolume(0.7f);
 }
 
 void VideoAnalyzerDialog::keyPressEvent(QKeyEvent *event)
@@ -1017,10 +974,14 @@ void VideoAnalyzerDialog::onBrowseClicked()
 		transcriptView->clear();
 		exportButton->setEnabled(false);
 		
-		/* Load video into player */
-		mediaPlayer->setSource(QUrl::fromLocalFile(path));
-		
 		statusLabel->setText("Loading video...");
+		
+		/* Load video into FFmpeg player */
+		if (videoPlayer->openFile(path)) {
+			statusLabel->setText("Video loaded successfully!");
+		} else {
+			statusLabel->setText("Failed to load video");
+		}
 		
 		/* Load waveform in background */
 		loadWaveform(path);
@@ -1029,21 +990,21 @@ void VideoAnalyzerDialog::onBrowseClicked()
 
 void VideoAnalyzerDialog::onPlayPauseClicked()
 {
-	if (mediaPlayer->playbackState() == QMediaPlayer::PlayingState) {
-		mediaPlayer->pause();
+	if (videoPlayer->isPlaying()) {
+		videoPlayer->pause();
 	} else {
-		mediaPlayer->play();
+		videoPlayer->play();
 	}
 }
 
 void VideoAnalyzerDialog::onStopClicked()
 {
-	mediaPlayer->stop();
+	videoPlayer->stop();
 }
 
 void VideoAnalyzerDialog::updatePlayPauseButton()
 {
-	if (mediaPlayer->playbackState() == QMediaPlayer::PlayingState) {
+	if (videoPlayer->isPlaying()) {
 		playPauseButton->setText("⏸");
 	} else {
 		playPauseButton->setText("▶");
@@ -1053,16 +1014,27 @@ void VideoAnalyzerDialog::updatePlayPauseButton()
 void VideoAnalyzerDialog::onPositionChanged(qint64 position)
 {
 	timeline->setPosition(position);
-	timeLabel->setText(formatTime(position) + " / " + formatTime(mediaPlayer->duration()));
+	timeLabel->setText(formatTime(position) + " / " + formatTime((qint64)(videoPlayer->getDuration() * 1000)));
 	
 	/* Skip cut regions during playback */
-	if (mediaPlayer->playbackState() == QMediaPlayer::PlayingState) {
-		const auto &cutRegions = timeline->getCutRegions();
-		for (const auto &region : cutRegions) {
-			if (position >= region.first && position < region.second) {
-				/* We're in a cut region, skip to end */
-				mediaPlayer->setPosition(region.second);
-				return;
+	if (videoPlayer->isPlaying()) {
+		bool checkCutRegions = true;
+		
+		if (skipTargetPosition > 0) {
+			if (position >= skipTargetPosition)
+				skipTargetPosition = 0;
+			else
+				checkCutRegions = false;
+		}
+		
+		if (checkCutRegions) {
+			const auto &cutRegions = timeline->getCutRegions();
+			for (const auto &region : cutRegions) {
+				if (position >= region.first && position < region.second) {
+					skipTargetPosition = region.second;
+					videoPlayer->seek((double)region.second / 1000.0);
+					return;
+				}
 			}
 		}
 	}
@@ -1072,7 +1044,6 @@ void VideoAnalyzerDialog::onPositionChanged(qint64 position)
 	int scrollPos = timelineScroll->horizontalScrollBar()->value();
 	int viewWidth = timelineScroll->viewport()->width();
 	
-	/* If playhead is outside visible area, scroll to center it */
 	if (playheadX < scrollPos + 50 || playheadX > scrollPos + viewWidth - 50) {
 		int newScrollPos = playheadX - viewWidth / 2;
 		timelineScroll->horizontalScrollBar()->setValue(newScrollPos);
@@ -1086,7 +1057,7 @@ void VideoAnalyzerDialog::onDurationChanged(qint64 duration)
 
 void VideoAnalyzerDialog::onTimelineClicked(qint64 position)
 {
-	mediaPlayer->setPosition(position);
+	videoPlayer->seek((double)position / 1000.0);
 }
 
 QString VideoAnalyzerDialog::formatTime(qint64 ms)
@@ -1108,13 +1079,16 @@ QString VideoAnalyzerDialog::formatTime(qint64 ms)
 
 void VideoAnalyzerDialog::onTranscriptClicked()
 {
+	if (updatingTranscript)
+		return;
+	
 	/* Get clicked position and find corresponding timestamp */
 	QTextCursor cursor = transcriptView->textCursor();
 	int block = cursor.blockNumber();
 	
 	if (block >= 0 && block < (int)transcriptSegments.size()) {
 		double timestamp = transcriptSegments[block].start;
-		mediaPlayer->setPosition((qint64)(timestamp * 1000));
+		videoPlayer->seek(timestamp);
 	}
 }
 
@@ -1189,10 +1163,13 @@ void VideoAnalyzerDialog::onTranscriptionComplete(const QJsonArray &segments)
 
 void VideoAnalyzerDialog::populateTranscript()
 {
+	updatingTranscript = true;
+	
 	QString html;
 	const auto &cutRegions = timeline->getCutRegions();
 	
-	for (const auto &seg : transcriptSegments) {
+	for (int i = 0; i < (int)transcriptSegments.size(); i++) {
+		const auto &seg = transcriptSegments[i];
 		int mins = (int)(seg.start / 60);
 		int secs = (int)seg.start % 60;
 		QString timestamp = QString("[%1:%2]").arg(mins).arg(secs, 2, 10, QChar('0'));
@@ -1210,18 +1187,122 @@ void VideoAnalyzerDialog::populateTranscript()
 			}
 		}
 		
+		/* Check if this segment is a search match */
+		bool isCurrentMatch = (currentSearchIndex >= 0 && 
+			currentSearchIndex < (int)searchMatchIndices.size() &&
+			searchMatchIndices[currentSearchIndex] == i);
+		bool isMatch = std::find(searchMatchIndices.begin(), searchMatchIndices.end(), i) != searchMatchIndices.end();
+		
+		/* Highlight search matches in the text */
+		QString displayText = seg.text.toHtmlEscaped();
+		if (!currentSearchQuery.isEmpty() && isMatch) {
+			/* Highlight all occurrences of the search term */
+			QString searchTerm = currentSearchQuery.toHtmlEscaped();
+			QString highlightColor = isCurrentMatch ? "#ff0" : "#fa0";
+			QString replacement = QString("<span style='background-color: %1; color: #000; padding: 0 2px; border-radius: 2px;'>%2</span>")
+				.arg(highlightColor, searchTerm);
+			displayText.replace(searchTerm, replacement, Qt::CaseInsensitive);
+		}
+		
+		QString bgStyle = isCurrentMatch ? "background-color: rgba(255, 170, 0, 0.2);" : "";
+		
 		if (isCut) {
 			/* Strikethrough and italic for cut segments */
-			html += QString("<p style='margin: 4px 0; cursor: pointer; text-decoration: line-through; font-style: italic; opacity: 0.5;'>"
+			html += QString("<p style='margin: 4px 0; cursor: pointer; text-decoration: line-through; font-style: italic; opacity: 0.5; %3'>"
 			                "<span style='color: #888; font-weight: bold;'>%1</span> %2</p>")
-			        .arg(timestamp, seg.text.toHtmlEscaped());
+			        .arg(timestamp, displayText, bgStyle);
 		} else {
-			html += QString("<p style='margin: 4px 0; cursor: pointer;'>"
+			html += QString("<p style='margin: 4px 0; cursor: pointer; %3'>"
 			                "<span style='color: #0af; font-weight: bold;'>%1</span> %2</p>")
-			        .arg(timestamp, seg.text.toHtmlEscaped());
+			        .arg(timestamp, displayText, bgStyle);
 		}
 	}
 	transcriptView->setHtml(html);
+	
+	updatingTranscript = false;
+}
+
+void VideoAnalyzerDialog::onSearchTextChanged(const QString &text)
+{
+	currentSearchQuery = text.trimmed();
+	searchMatchIndices.clear();
+	currentSearchIndex = -1;
+	
+	if (currentSearchQuery.isEmpty()) {
+		searchPrevButton->setEnabled(false);
+		searchNextButton->setEnabled(false);
+		searchResultsLabel->setText("");
+		populateTranscript();
+		return;
+	}
+	
+	/* Find all matching segments */
+	for (int i = 0; i < (int)transcriptSegments.size(); i++) {
+		if (transcriptSegments[i].text.contains(currentSearchQuery, Qt::CaseInsensitive)) {
+			searchMatchIndices.push_back(i);
+		}
+	}
+	
+	bool hasMatches = !searchMatchIndices.empty();
+	searchPrevButton->setEnabled(hasMatches);
+	searchNextButton->setEnabled(hasMatches);
+	
+	if (hasMatches) {
+		currentSearchIndex = 0;
+		searchResultsLabel->setText(QString("%1 of %2").arg(1).arg(searchMatchIndices.size()));
+		jumpToSearchResult(0);
+	} else {
+		searchResultsLabel->setText("No results");
+		populateTranscript();
+	}
+}
+
+void VideoAnalyzerDialog::onSearchNext()
+{
+	if (searchMatchIndices.empty()) return;
+	
+	currentSearchIndex = (currentSearchIndex + 1) % (int)searchMatchIndices.size();
+	searchResultsLabel->setText(QString("%1 of %2").arg(currentSearchIndex + 1).arg(searchMatchIndices.size()));
+	jumpToSearchResult(currentSearchIndex);
+}
+
+void VideoAnalyzerDialog::onSearchPrev()
+{
+	if (searchMatchIndices.empty()) return;
+	
+	currentSearchIndex = (currentSearchIndex - 1 + (int)searchMatchIndices.size()) % (int)searchMatchIndices.size();
+	searchResultsLabel->setText(QString("%1 of %2").arg(currentSearchIndex + 1).arg(searchMatchIndices.size()));
+	jumpToSearchResult(currentSearchIndex);
+}
+
+void VideoAnalyzerDialog::highlightSearchResults()
+{
+	populateTranscript();
+}
+
+void VideoAnalyzerDialog::jumpToSearchResult(int index)
+{
+	if (index < 0 || index >= (int)searchMatchIndices.size()) return;
+	
+	int segmentIndex = searchMatchIndices[index];
+	if (segmentIndex < 0 || segmentIndex >= (int)transcriptSegments.size()) return;
+	
+	/* Update the transcript display to highlight current match */
+	populateTranscript();
+	
+	/* Scroll to the matching segment */
+	QTextCursor cursor = transcriptView->textCursor();
+	cursor.movePosition(QTextCursor::Start);
+	for (int i = 0; i < segmentIndex; i++) {
+		cursor.movePosition(QTextCursor::NextBlock);
+	}
+	transcriptView->setTextCursor(cursor);
+	transcriptView->ensureCursorVisible();
+	
+	/* Jump video to that timestamp */
+	const auto &seg = transcriptSegments[segmentIndex];
+	qint64 posMs = (qint64)(seg.start * 1000);
+	videoPlayer->seek(posMs);
 }
 
 void VideoAnalyzerDialog::onAnalysisError(const QString &error)
@@ -1239,8 +1320,8 @@ void VideoAnalyzerDialog::onExportClicked()
 		onExportJSON();
 	} else if (format == "csv") {
 		onExportCSV();
-	} else if (format == "youtube") {
-		onExportYouTube();
+	} else if (format == "youtube_ai") {
+		onExportYouTubeAI();
 	}
 }
 
@@ -1401,7 +1482,7 @@ void VideoAnalyzerDialog::onSaveEditedVideoClicked()
 	if (savePath.isEmpty())
 		return;
 
-	double totalDuration = mediaPlayer->duration() / 1000.0;
+	double totalDuration = videoPlayer->getDuration();
 
 	statusLabel->setText("Processing video (this may take a while)...");
 
@@ -1571,217 +1652,295 @@ void VideoAnalyzerDialog::onExportCSV()
 	}
 }
 
-void VideoAnalyzerDialog::onExportYouTube()
+void VideoAnalyzerDialog::onExportYouTubeAI()
 {
-	QString path = QFileDialog::getSaveFileName(this, "Export YouTube Chapters", QString(), "Text Files (*.txt)");
-	if (path.isEmpty()) return;
-
-	QFile file(path);
-	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-		QTextStream out(&file);
-		out << "YouTube Chapters\n";
-		out << "================\n\n";
+	if (transcriptSegments.empty()) {
+		QMessageBox::warning(this, "Export", "No transcript available. Please analyze a video first.");
+		return;
+	}
+	
+	/* Check if llama-cli is available */
+	if (!LlamaRunner::isLlamaCliAvailable()) {
+		QMessageBox::warning(this, "Missing Component",
+			"The llama-cli helper binary is not available.\n\n"
+			"Chapter generation requires llama-cli to be installed.\n"
+			"You can install it via: brew install llama.cpp");
+		return;
+	}
+	
+	/* Use a static LLM runner instance to persist across calls */
+	static LlamaRunner *llm = nullptr;
+	if (!llm) {
+		llm = new LlamaRunner();
+	}
+	
+	QString defaultModel = "qwen2.5-3b";
+	
+	if (!LlamaRunner::isModelDownloaded(defaultModel.toStdString())) {
+		QMessageBox::StandardButton reply = QMessageBox::question(
+			this, "Download AI Model",
+			QString("The AI chapter generation requires downloading a language model (%1, ~2.1GB).\n\n"
+			        "Would you like to download it now?").arg(defaultModel),
+			QMessageBox::Yes | QMessageBox::No
+		);
 		
-		/* Create chapters from transcript segments */
-		for (const auto &seg : transcriptSegments) {
-			int mins = (int)(seg.start / 60);
-			int secs = (int)seg.start % 60;
-			/* Truncate text for chapter title */
-			QString title = seg.text.left(50);
-			if (seg.text.length() > 50) title += "...";
-			out << QString("%1:%2 %3\n").arg(mins).arg(secs, 2, 10, QChar('0')).arg(title);
+		if (reply != QMessageBox::Yes) {
+			return;
 		}
 		
-		file.close();
-		QMessageBox::information(this, "Export", "Exported to " + path);
+		/* Download the model synchronously with progress updates */
+		progressBar->setVisible(true);
+		progressBar->setValue(0);
+		statusLabel->setText("Downloading AI model...");
+		analyzeButton->setEnabled(false);
+		exportButton->setEnabled(false);
+		
+		/* Use QtConcurrent for background download */
+		QFutureWatcher<bool> *watcher = new QFutureWatcher<bool>(this);
+		
+		connect(watcher, &QFutureWatcher<bool>::finished, this, [=]() {
+			bool success = watcher->result();
+			progressBar->setVisible(false);
+			analyzeButton->setEnabled(true);
+			exportButton->setEnabled(true);
+			
+			if (success) {
+				statusLabel->setText("Model downloaded. Click Export again.");
+			} else {
+				statusLabel->setText("Download failed");
+				QMessageBox::warning(this, "Download Failed", 
+					"Could not download the AI model. Please check your internet connection.");
+			}
+			watcher->deleteLater();
+		});
+		
+		QFuture<bool> future = QtConcurrent::run([=]() {
+			return LlamaRunner::downloadModel(defaultModel.toStdString(), 
+				[this](int progress, const std::string &status) {
+					QMetaObject::invokeMethod(this, [=]() {
+						progressBar->setValue(progress);
+						statusLabel->setText(QString::fromStdString(status));
+					}, Qt::QueuedConnection);
+				});
+		});
+		
+		watcher->setFuture(future);
+		return;
 	}
+	
+	/* Set the model */
+	if (!llm->setModel(defaultModel.toStdString())) {
+		QMessageBox::warning(this, "Error", "Could not find the AI model file.");
+		return;
+	}
+	
+	/* Prepare transcript segments for LLM */
+	std::vector<std::pair<double, std::string>> segments;
+	for (const auto &seg : transcriptSegments) {
+		segments.push_back({seg.start, seg.text.toStdString()});
+	}
+	
+	/* Generate chapters */
+	statusLabel->setText("Generating smart chapters...");
+	progressBar->setVisible(true);
+	progressBar->setValue(0);
+	analyzeButton->setEnabled(false);
+	exportButton->setEnabled(false);
+	QApplication::processEvents();
+	
+	/* Run in background thread */
+	QFutureWatcher<std::vector<LlamaRunnerChapter>> *chapterWatcher = 
+		new QFutureWatcher<std::vector<LlamaRunnerChapter>>(this);
+	
+	connect(chapterWatcher, &QFutureWatcher<std::vector<LlamaRunnerChapter>>::finished, this, [=]() {
+		std::vector<LlamaRunnerChapter> chapters = chapterWatcher->result();
+		
+		progressBar->setVisible(false);
+		analyzeButton->setEnabled(true);
+		exportButton->setEnabled(true);
+		
+		if (chapters.empty()) {
+			statusLabel->setText("Chapter generation failed");
+			QMessageBox::warning(this, "Error", "Could not generate chapters. Check the log for details.");
+			chapterWatcher->deleteLater();
+			return;
+		}
+		
+		/* Convert to the format expected by the rest of the code */
+		std::vector<LlamaRunnerChapter> resultChapters = chapters;
+		
+		/* Show results dialog - inline the rest of the original code */
+		statusLabel->setText(QString("Generated %1 chapters").arg(resultChapters.size()));
+		
+		/* Build YouTube-formatted chapters */
+		QString youtubeChapters;
+		for (const auto &ch : resultChapters) {
+			int mins = (int)(ch.timestamp / 60);
+			int secs = (int)ch.timestamp % 60;
+			youtubeChapters += QString("%1:%2 %3\n")
+				.arg(mins)
+				.arg(secs, 2, 10, QChar('0'))
+				.arg(QString::fromStdString(ch.title));
+		}
+		
+		/* Show in dialog */
+		QDialog exportDialog(const_cast<VideoAnalyzerDialog*>(this));
+		exportDialog.setWindowTitle("YouTube Export");
+		exportDialog.setMinimumSize(500, 400);
+		
+		QVBoxLayout *layout = new QVBoxLayout(&exportDialog);
+		
+		QLabel *label = new QLabel("Generated YouTube chapters (copy to video description):");
+		layout->addWidget(label);
+		
+		QTextEdit *textEdit = new QTextEdit();
+		textEdit->setPlainText(youtubeChapters);
+		textEdit->setReadOnly(true);
+		layout->addWidget(textEdit);
+		
+		QHBoxLayout *buttonLayout = new QHBoxLayout();
+		QPushButton *copyBtn = new QPushButton("Copy to Clipboard");
+		QPushButton *closeBtn = new QPushButton("Close");
+		buttonLayout->addWidget(copyBtn);
+		buttonLayout->addWidget(closeBtn);
+		layout->addLayout(buttonLayout);
+		
+		connect(copyBtn, &QPushButton::clicked, [&]() {
+			QApplication::clipboard()->setText(youtubeChapters);
+			copyBtn->setText("Copied!");
+		});
+		connect(closeBtn, &QPushButton::clicked, &exportDialog, &QDialog::accept);
+		
+		exportDialog.exec();
+		chapterWatcher->deleteLater();
+	});
+	
+	QFuture<std::vector<LlamaRunnerChapter>> future = QtConcurrent::run([=]() {
+		return llm->generateChapters(segments,
+			[this](int progress, const std::string &status) {
+				QMetaObject::invokeMethod(this, [=]() {
+					progressBar->setValue(progress);
+					statusLabel->setText(QString::fromStdString(status));
+				}, Qt::QueuedConnection);
+			});
+	});
+	
+	chapterWatcher->setFuture(future);
 }
 
 void VideoAnalyzerDialog::loadWaveform(const QString &videoPath)
 {
-	/* Extract waveform data using FFmpeg in a separate thread */
+	/* Extract waveform data using FFmpeg command line in a separate thread */
+	statusLabel->setText("Extracting waveform...");
+	
 	QString tempDir = QDir::tempPath();
-	QString scriptPath = tempDir + "/obs_waveform.py";
 	QString outputPath = tempDir + "/obs_waveform.json";
-
-	QFile scriptFile(scriptPath);
-	if (!scriptFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-		statusLabel->setText("Could not create waveform script");
-		return;
-	}
-
-	QString pythonScript = R"PYTHON(
-import sys
-import os
-import json
-import subprocess
-import struct
-import tempfile
-
-os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
-
-video_path = sys.argv[1]
-output_path = sys.argv[2]
-
-# Calculate number of samples based on duration
-# Target: ~4 samples per second for good detail at 8 pixels/sec zoom
-# This will be calculated after getting duration
-
-# Get duration
-try:
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-           "-of", "default=noprint_wrappers=1:nokey=1", video_path]
-    duration = float(subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip())
-except:
-    duration = 0
-
-# Calculate samples: ~4 samples per second, minimum 100, maximum 4000
-num_samples = max(100, min(4000, int(duration * 4)))
-
-if duration == 0:
-    with open(output_path, "w") as f:
-        json.dump([0.1] * 100, f)
-    sys.exit(0)
-
-# Extract raw audio samples using FFmpeg
-# Output as signed 16-bit PCM, mono, 8kHz
-temp_pcm = tempfile.NamedTemporaryFile(suffix='.raw', delete=False)
-temp_pcm.close()
-
-cmd = [
-    "ffmpeg", "-y", "-i", video_path,
-    "-ac", "1",           # Mono
-    "-ar", "8000",        # 8kHz sample rate
-    "-f", "s16le",        # Signed 16-bit little-endian
-    "-acodec", "pcm_s16le",
-    temp_pcm.name
-]
-
-try:
-    subprocess.run(cmd, capture_output=True, timeout=120)
-except Exception as e:
-    with open(output_path, "w") as f:
-        json.dump([0.1] * num_samples, f)
-    sys.exit(0)
-
-# Read PCM data and calculate peak levels per segment
-try:
-    with open(temp_pcm.name, 'rb') as f:
-        pcm_data = f.read()
-    os.unlink(temp_pcm.name)
-except:
-    with open(output_path, "w") as f:
-        json.dump([0.1] * num_samples, f)
-    sys.exit(0)
-
-# Parse samples (16-bit signed integers)
-num_raw_samples = len(pcm_data) // 2
-if num_raw_samples == 0:
-    with open(output_path, "w") as f:
-        json.dump([0.1] * num_samples, f)
-    sys.exit(0)
-
-samples = struct.unpack(f'<{num_raw_samples}h', pcm_data)
-
-# Calculate peak amplitude for each segment
-samples_per_segment = max(1, num_raw_samples // num_samples)
-waveform = []
-
-for i in range(num_samples):
-    start_idx = i * samples_per_segment
-    end_idx = min(start_idx + samples_per_segment, num_raw_samples)
-    
-    if start_idx >= num_raw_samples:
-        waveform.append(0.0)
-        continue
-    
-    segment = samples[start_idx:end_idx]
-    
-    # Get peak (maximum absolute value)
-    peak = max(abs(min(segment)), abs(max(segment))) if segment else 0
-    
-    # Normalize to 0-1 range (16-bit max is 32767)
-    amplitude = peak / 32767.0
-    
-    # Apply some curve to make quieter parts more visible
-    amplitude = amplitude ** 0.6  # Compress dynamic range slightly
-    
-    waveform.append(amplitude)
-
-# Normalize to use full range
-if waveform:
-    max_amp = max(waveform) if max(waveform) > 0 else 1
-    waveform = [min(1.0, a / max_amp) for a in waveform]
-
-with open(output_path, "w") as f:
-    json.dump(waveform, f)
-)PYTHON";
-
-	QTextStream out(&scriptFile);
-	out << pythonScript;
-	scriptFile.close();
-
-	/* Run in background thread */
+	
+	/* Use FFmpeg directly via QProcess in background */
 	QThread *waveformThread = new QThread();
-	QProcess *process = new QProcess();
 	
 	connect(waveformThread, &QThread::started, [=]() {
-		QStringList pythonPaths = {
-			QDir::homePath() + "/.venv/main/bin/python",
-			"/opt/homebrew/bin/python3",
-			"/usr/local/bin/python3",
-			"python3"
-		};
-
-		QString pythonPath;
-		for (const QString &path : pythonPaths) {
-			if (QFile::exists(path)) {
-				pythonPath = path;
-				break;
-			}
+		/* First get duration using ffprobe */
+		QProcess ffprobe;
+		ffprobe.start("ffprobe", {"-v", "error", "-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1", videoPath});
+		ffprobe.waitForFinished(30000);
+		
+		double duration = 0;
+		QString durationStr = ffprobe.readAllStandardOutput().trimmed();
+		if (!durationStr.isEmpty()) {
+			duration = durationStr.toDouble();
 		}
-
-		if (!pythonPath.isEmpty()) {
-			process->start(pythonPath, {scriptPath, videoPath, outputPath});
-			process->waitForFinished(60000);
-		}
-	});
-
-	connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-		[=](int exitCode, QProcess::ExitStatus) {
-			QFile::remove(scriptPath);
-			
-			if (exitCode == 0) {
-				QFile outputFile(outputPath);
-				if (outputFile.open(QIODevice::ReadOnly)) {
-					QJsonDocument doc = QJsonDocument::fromJson(outputFile.readAll());
-					outputFile.close();
-					QFile::remove(outputPath);
-					
-					if (doc.isArray()) {
-						std::vector<float> waveformData;
-						QJsonArray arr = doc.array();
-						for (int i = 0; i < arr.size(); i++) {
-							waveformData.push_back((float)arr[i].toDouble());
-						}
-						
-						/* Update UI on main thread */
-						QMetaObject::invokeMethod(timeline, [this, waveformData]() {
-							timeline->setWaveform(waveformData);
-							statusLabel->setText("Video loaded. Click Analyze to process.");
-						}, Qt::QueuedConnection);
-					}
-				}
-			}
-			
+		
+		if (duration <= 0) {
+			QMetaObject::invokeMethod(this, [this]() {
+				statusLabel->setText("Could not determine video duration");
+			}, Qt::QueuedConnection);
 			waveformThread->quit();
-		});
-
-	connect(waveformThread, &QThread::finished, [=]() {
-		process->deleteLater();
-		waveformThread->deleteLater();
+			return;
+		}
+		
+		/* Extract raw PCM audio */
+		QString tempPcm = tempDir + "/obs_temp_audio.raw";
+		QProcess ffmpeg;
+		ffmpeg.start("ffmpeg", {"-y", "-i", videoPath,
+			"-ac", "1", "-ar", "8000", "-f", "s16le", "-acodec", "pcm_s16le", tempPcm});
+		ffmpeg.waitForFinished(120000);
+		
+		/* Read PCM data */
+		QFile pcmFile(tempPcm);
+		if (!pcmFile.open(QIODevice::ReadOnly)) {
+			QMetaObject::invokeMethod(this, [this]() {
+				statusLabel->setText("Could not extract audio");
+			}, Qt::QueuedConnection);
+			waveformThread->quit();
+			return;
+		}
+		
+		QByteArray pcmData = pcmFile.readAll();
+		pcmFile.close();
+		QFile::remove(tempPcm);
+		
+		int numRawSamples = pcmData.size() / 2;
+		if (numRawSamples == 0) {
+			QMetaObject::invokeMethod(this, [this]() {
+				statusLabel->setText("No audio data found");
+			}, Qt::QueuedConnection);
+			waveformThread->quit();
+			return;
+		}
+		
+		/* Parse 16-bit samples */
+		const int16_t *samples = reinterpret_cast<const int16_t*>(pcmData.constData());
+		
+		/* Calculate waveform */
+		int numSegments = qMax(100, qMin(4000, (int)(duration * 4)));
+		int samplesPerSegment = qMax(1, numRawSamples / numSegments);
+		
+		std::vector<float> waveformData;
+		waveformData.reserve(numSegments);
+		
+		for (int i = 0; i < numSegments; i++) {
+			int startIdx = i * samplesPerSegment;
+			int endIdx = qMin(startIdx + samplesPerSegment, numRawSamples);
+			
+			if (startIdx >= numRawSamples) {
+				waveformData.push_back(0.0f);
+				continue;
+			}
+			
+			/* Get peak amplitude in segment */
+			int16_t maxVal = 0;
+			for (int j = startIdx; j < endIdx; j++) {
+				int16_t absVal = qAbs(samples[j]);
+				if (absVal > maxVal) maxVal = absVal;
+			}
+			
+			/* Normalize to 0-1 */
+			float amplitude = (float)maxVal / 32767.0f;
+			amplitude = std::pow(amplitude, 0.6f); /* Compress dynamic range */
+			waveformData.push_back(amplitude);
+		}
+		
+		/* Normalize to use full range */
+		float maxAmp = *std::max_element(waveformData.begin(), waveformData.end());
+		if (maxAmp > 0) {
+			for (float &amp : waveformData) {
+				amp = qMin(1.0f, amp / maxAmp);
+			}
+		}
+		
+		/* Update UI on main thread */
+		QMetaObject::invokeMethod(this, [this, waveformData, duration]() {
+			timeline->setDuration((qint64)(duration * 1000));
+			timeline->setWaveform(waveformData);
+			statusLabel->setText("Video loaded. Click Analyze to transcribe.");
+		}, Qt::QueuedConnection);
+		
+		waveformThread->quit();
 	});
-
+	
+	connect(waveformThread, &QThread::finished, waveformThread, &QThread::deleteLater);
 	waveformThread->start();
 }
 

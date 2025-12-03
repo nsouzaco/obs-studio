@@ -1,8 +1,51 @@
 cmake_minimum_required(VERSION 3.28...3.30)
 
-find_package(Qt6 REQUIRED Widgets Multimedia MultimediaWidgets)
-find_package(FFmpeg REQUIRED COMPONENTS avcodec avformat avutil swresample)
+find_package(Qt6 REQUIRED Widgets Multimedia Network Concurrent)
+find_package(FFmpeg REQUIRED COMPONENTS avcodec avformat avutil swresample swscale)
 
+# Build whisper.cpp as a static library (for transcription only)
+set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(WHISPER_SDL2 OFF CACHE BOOL "" FORCE)
+set(WHISPER_CURL OFF CACHE BOOL "" FORCE)
+set(WHISPER_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(WHISPER_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+
+# Disable CoreML and BLAS to avoid compatibility issues
+set(WHISPER_COREML OFF CACHE BOOL "" FORCE)
+set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
+
+# Temporarily remove -Werror from compile flags for whisper subdirectory
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error -Wno-unreachable-code -Wno-unguarded-availability-new -Wno-quoted-include-in-framework-header")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wno-unreachable-code -Wno-unguarded-availability-new -Wno-quoted-include-in-framework-header")
+set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -Wno-error -Wno-objc-protocol-method-implementation -Wno-quoted-include-in-framework-header")
+
+add_subdirectory("${CMAKE_SOURCE_DIR}/deps/whisper.cpp" "${CMAKE_BINARY_DIR}/deps/whisper.cpp" EXCLUDE_FROM_ALL)
+
+# =============================================================================
+# llama-cli helper binary
+# =============================================================================
+# NOTE: We do NOT build llama.cpp as part of OBS because:
+# 1. whisper.cpp already includes ggml which causes symbol conflicts
+# 2. Different llama.cpp/ggml versions have incompatible APIs
+#
+# Instead, LlamaRunner will look for llama-cli in these locations:
+# - OBS.app/Contents/Helpers/llama-cli (bundled)
+# - /opt/homebrew/bin/llama-cli (homebrew on Apple Silicon)
+# - /usr/local/bin/llama-cli (homebrew on Intel or manual install)
+#
+# Users can install llama-cli via: brew install llama.cpp
+message(STATUS "LLM chapter generation will use external llama-cli (install via: brew install llama.cpp)")
+
+# =============================================================================
+# Main plugin
+# =============================================================================
 add_library(obs-ai-toolkit MODULE)
 add_library(OBS::obs-ai-toolkit ALIAS obs-ai-toolkit)
 
@@ -10,6 +53,7 @@ if(NOT TARGET OBS::qt-wrappers)
   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/qt/wrappers" "${CMAKE_BINARY_DIR}/shared/qt/wrappers")
 endif()
 
+# Plugin sources - using LlamaRunner (subprocess) instead of linked llama
 target_sources(
   obs-ai-toolkit
   PRIVATE
@@ -20,6 +64,14 @@ target_sources(
     quality-advisor.hpp
     video-analyzer-dialog.cpp
     video-analyzer-dialog.hpp
+    video-player.cpp
+    video-player.hpp
+    ffmpeg-utils.cpp
+    ffmpeg-utils.hpp
+    whisper-utils.cpp
+    whisper-utils.hpp
+    llama-runner.cpp
+    llama-runner.hpp
 )
 
 target_sources(
@@ -36,11 +88,20 @@ target_link_libraries(
     OBS::qt-wrappers
     Qt::Widgets
     Qt::Multimedia
-    Qt::MultimediaWidgets
+    Qt::Network
+    Qt::Concurrent
     FFmpeg::avcodec
     FFmpeg::avformat
     FFmpeg::avutil
     FFmpeg::swresample
+    FFmpeg::swscale
+    whisper
+)
+
+# Include whisper headers only (no llama - we use subprocess)
+target_include_directories(obs-ai-toolkit PRIVATE 
+    "${CMAKE_SOURCE_DIR}/deps/whisper.cpp/include"
+    "${CMAKE_SOURCE_DIR}/deps/whisper.cpp/ggml/include"
 )
 
 if(OS_WINDOWS)
