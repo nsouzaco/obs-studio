@@ -77,7 +77,6 @@ frontend/plugins/obs-ai-toolkit/
 - **macOS** (Apple Silicon or Intel)
 - **Xcode** with command line tools
 - **CMake** 3.28+
-- **Homebrew** packages: `brew install ffmpeg cmake ninja`
 
 ### Build
 
