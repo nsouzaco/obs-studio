@@ -67,10 +67,15 @@ frontend/plugins/obs-ai-toolkit/
 ├── ffmpeg-utils.cpp/hpp           # Audio extraction, video encoding
 ├── whisper-utils.cpp/hpp          # Whisper model loading, transcription
 ├── llama-runner.cpp/hpp           # LLM subprocess management
-└── CMakeLists.txt                 # Build configuration
+├── CMakeLists.txt                 # Build configuration
+└── test/
+    ├── test-utils.cpp             # Unit tests (26 tests)
+    └── test-integration.cpp       # Integration tests (25 tests)
 
 cmake/
 └── BuildLlamaCpp.cmake            # ExternalProject config for llama.cpp
+                                   # Builds llama-cli (b5270) with Metal on macOS
+                                   # Universal binary (arm64 + x86_64)
 ```
 
 ## Setup + Run Steps
@@ -112,6 +117,46 @@ The llama.cpp inference engine is built automatically during compilation and bun
 5. Click **Analyze** to transcribe
 6. Use the transcript to navigate, search, or mark cuts
 7. Export as JSON, CSV, or YouTube Chapters
+
+## Testing
+
+The plugin includes 51 tests covering core functionality.
+
+### Run Tests
+
+```bash
+# Configure with tests enabled
+cd build_macos
+cmake -DENABLE_AI_TOOLKIT_TESTS=ON ..
+
+# Build tests
+cmake --build . --target test-ai-toolkit-utils test-ai-toolkit-integration
+
+# Run unit tests (26 tests)
+DYLD_FRAMEWORK_PATH="../.deps/obs-deps-qt6-2025-08-23-universal/lib" \
+  ./frontend/plugins/obs-ai-toolkit/test/Debug/test-ai-toolkit-utils
+
+# Run integration tests (25 tests)
+DYLD_FRAMEWORK_PATH="../.deps/obs-deps-qt6-2025-08-23-universal/lib" \
+DYLD_LIBRARY_PATH="../.deps/obs-deps-2025-08-23-universal/lib" \
+  ./frontend/plugins/obs-ai-toolkit/test/Debug/test-ai-toolkit-integration
+```
+
+### Test Coverage
+
+| Category | Tests |
+|----------|-------|
+| Model management (Whisper/LLM) | 8 |
+| Timeline position/pixel math | 4 |
+| Cut region logic | 4 |
+| Time formatting | 4 |
+| YouTube chapter format/parse | 4 |
+| Transcript segments | 2 |
+| FFmpeg error handling | 10 |
+| Filesystem operations | 5 |
+| Process execution | 3 |
+| Model URL validation | 3 |
+| Error handling | 4 |
 
 ## Technical Decisions
 
