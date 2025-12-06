@@ -274,3 +274,4 @@ FFmpegAudioExtractor::WaveformResult FFmpegAudioExtractor::extractWaveform(
 	return result;
 }
 
+

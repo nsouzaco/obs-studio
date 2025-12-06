@@ -142,3 +142,4 @@ void QualityAdvisor::reset()
 
 #include "moc_quality-advisor.cpp"
 
+

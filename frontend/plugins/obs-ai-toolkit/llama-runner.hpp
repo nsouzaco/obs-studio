@@ -127,3 +127,4 @@ private:
 	QStringList buildArgs(const std::string &prompt, int maxTokens);
 };
 
+

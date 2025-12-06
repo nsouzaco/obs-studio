@@ -114,10 +114,8 @@ bool WhisperTranscriber::downloadModel(
 	QProcess process;
 	process.setProcessChannelMode(QProcess::MergedChannels);
 	
-	/* Try curl first, fall back to wget */
 	QStringList curlArgs = {
-		"-L",  /* Follow redirects */
-		"-k",  /* Allow insecure connections (skip cert verification) */
+		"-L", "-k",
 		"-o", QString::fromStdString(destPath),
 		"--progress-bar",
 		QString::fromStdString(targetModel.url)
@@ -189,9 +187,8 @@ WhisperTranscriber::~WhisperTranscriber()
 
 bool WhisperTranscriber::loadModel(const std::string &modelName)
 {
-	if (ctx && loadedModelName == modelName) {
-		return true; /* Already loaded */
-	}
+	if (ctx && loadedModelName == modelName)
+		return true;
 	
 	unloadModel();
 	
@@ -426,12 +423,10 @@ WhisperResult WhisperTranscriber::transcribe(
 	wparams.single_segment = false;
 	wparams.token_timestamps = true;
 	
-	/* Set language if specified */
-	if (!language.empty() && language != "auto") {
+	if (!language.empty() && language != "auto")
 		wparams.language = language.c_str();
-	} else {
-		wparams.language = nullptr; /* Auto-detect */
-	}
+	else
+		wparams.language = nullptr;
 	
 	/* Progress callback wrapper */
 	struct ProgressData {

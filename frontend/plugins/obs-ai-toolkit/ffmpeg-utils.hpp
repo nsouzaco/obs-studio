@@ -38,3 +38,4 @@ public:
 	static double getDuration(const std::string &filePath);
 };
 
+

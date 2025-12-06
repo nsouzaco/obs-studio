@@ -68,6 +68,12 @@ include(cmake/feature-idian-playground.cmake)
 
 add_subdirectory(plugins)
 
+# Bundle llama-cli for AI toolkit (must be after plugins are added)
+if(TARGET llama-cpp-external)
+  include("${CMAKE_SOURCE_DIR}/cmake/BuildLlamaCpp.cmake")
+  bundle_llama_cli(obs-studio)
+endif()
+
 configure_file(cmake/templates/ui-config.h.in ui-config.h)
 
 target_sources(

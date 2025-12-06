@@ -28,20 +28,8 @@ set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -Wno-error -Wno-objc-protocol-method-i
 
 add_subdirectory("${CMAKE_SOURCE_DIR}/deps/whisper.cpp" "${CMAKE_BINARY_DIR}/deps/whisper.cpp" EXCLUDE_FROM_ALL)
 
-# =============================================================================
-# llama-cli helper binary
-# =============================================================================
-# NOTE: We do NOT build llama.cpp as part of OBS because:
-# 1. whisper.cpp already includes ggml which causes symbol conflicts
-# 2. Different llama.cpp/ggml versions have incompatible APIs
-#
-# Instead, LlamaRunner will look for llama-cli in these locations:
-# - OBS.app/Contents/Helpers/llama-cli (bundled)
-# - /opt/homebrew/bin/llama-cli (homebrew on Apple Silicon)
-# - /usr/local/bin/llama-cli (homebrew on Intel or manual install)
-#
-# Users can install llama-cli via: brew install llama.cpp
-message(STATUS "LLM chapter generation will use external llama-cli (install via: brew install llama.cpp)")
+# llama.cpp built via ExternalProject to avoid ggml symbol conflicts with whisper.cpp
+include("${CMAKE_SOURCE_DIR}/cmake/BuildLlamaCpp.cmake")
 
 # =============================================================================
 # Main plugin
@@ -121,4 +109,17 @@ set_target_properties_obs(
 )
 
 target_include_directories(obs-ai-toolkit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_dependencies(obs-ai-toolkit llama-cpp-external)
+
+# Note: llama-cli bundling is handled by post-build install step
+# The bundle_llama_cli function must be called from the same directory that creates obs-studio target
+# See frontend/CMakeLists.txt for the bundle step
+
+# =============================================================================
+# Tests (optional, controlled by ENABLE_AI_TOOLKIT_TESTS)
+# =============================================================================
+if(ENABLE_AI_TOOLKIT_TESTS)
+  add_subdirectory(test)
+endif()
 

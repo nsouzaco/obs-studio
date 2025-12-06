@@ -51,9 +51,9 @@ This project is built on top of [OBS Studio](https://github.com/obsproject/obs-s
 │           │                     │                     │         │
 │           ▼                     ▼                     ▼         │
 │      libavcodec            whisper.cpp           llama-cli      │
-│      libavformat           (static lib)          (subprocess)   │
-│      libswscale                                                 │
-│      libswresample                                              │
+│      libavformat           (static lib)          (bundled via   │
+│      libswscale                                   ExternalProject│
+│      libswresample                                + subprocess) │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -68,6 +68,9 @@ frontend/plugins/obs-ai-toolkit/
 ├── whisper-utils.cpp/hpp          # Whisper model loading, transcription
 ├── llama-runner.cpp/hpp           # LLM subprocess management
 └── CMakeLists.txt                 # Build configuration
+
+cmake/
+└── BuildLlamaCpp.cmake            # ExternalProject config for llama.cpp
 ```
 
 ## Setup + Run Steps
@@ -96,15 +99,9 @@ xcodebuild -project obs-studio.xcodeproj -configuration RelWithDebInfo -jobs 8
 open frontend/RelWithDebInfo/OBS.app
 ```
 
-### Optional: LLM Chapter Generation
+### AI Chapter Generation
 
-For AI-powered chapter generation, install llama.cpp:
-
-```bash
-brew install llama.cpp
-```
-
-The plugin will automatically detect `llama-cli` and enable the YouTube Chapters export option.
+The llama.cpp inference engine is built automatically during compilation and bundled with OBS.app — no additional installation required. The plugin downloads LLM models on-demand when you first use chapter generation.
 
 ### Using the Plugin
 
@@ -135,11 +132,12 @@ The original implementation used Python + openai-whisper, requiring users to hav
 
 ### Why llama-cli Subprocess Instead of Linked Library?
 
-whisper.cpp includes ggml (the tensor library). Linking llama.cpp would cause symbol conflicts since both include different ggml versions. Using a subprocess:
+whisper.cpp includes ggml (the tensor library). Linking llama.cpp would cause symbol conflicts since both include different ggml versions. Using CMake ExternalProject to build llama.cpp in complete isolation and invoking it as a subprocess:
 
-- **Avoids symbol conflicts** between ggml versions
-- **Allows independent updates** — Users can upgrade llama.cpp separately
-- **Graceful degradation** — Plugin works without LLM, just disables chapter generation
+- **Avoids symbol conflicts** — Built in separate build tree, no shared symbols
+- **Zero user setup** — llama-cli is bundled with OBS.app automatically
+- **GPU acceleration** — Built with Metal support on macOS for fast inference
+- **Universal binary** — arm64 + x86_64 for all Mac hardware
 
 ### UI/UX Decisions
 

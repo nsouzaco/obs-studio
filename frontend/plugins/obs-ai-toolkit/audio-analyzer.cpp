@@ -245,3 +245,4 @@ std::vector<AudioPeak> FFmpegAudioAnalyzer::findPeaks(
 	return peaks;
 }
 
+

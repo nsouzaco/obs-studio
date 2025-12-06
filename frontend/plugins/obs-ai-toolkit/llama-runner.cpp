@@ -86,33 +86,46 @@ std::string LlamaRunner::getModelPath(const std::string &modelName)
 
 std::string LlamaRunner::getLlamaCliPath()
 {
-	/* Look for llama-cli in the app bundle */
 	QString appPath = QCoreApplication::applicationDirPath();
 	
+#if defined(__APPLE__)
 	/* macOS: OBS.app/Contents/MacOS -> OBS.app/Contents/Helpers/llama-cli */
 	QString bundlePath = appPath + "/../Helpers/llama-cli";
 	if (QFile::exists(bundlePath)) {
 		return bundlePath.toStdString();
 	}
-	
-	/* Also try alongside the executable */
-	QString localPath = appPath + "/llama-cli";
-	if (QFile::exists(localPath)) {
-		return localPath.toStdString();
+#elif defined(_WIN32)
+	/* Windows: alongside the executable */
+	QString bundlePath = appPath + "/llama-cli.exe";
+	if (QFile::exists(bundlePath)) {
+		return bundlePath.toStdString();
 	}
-	
-	/* Fallback: check if llama-cli is in PATH */
-	QString systemPath = "/usr/local/bin/llama-cli";
-	if (QFile::exists(systemPath)) {
-		return systemPath.toStdString();
+#else
+	/* Linux: alongside the executable */
+	QString bundlePath = appPath + "/llama-cli";
+	if (QFile::exists(bundlePath)) {
+		return bundlePath.toStdString();
 	}
+#endif
 	
-	/* Try homebrew path */
+	/* Development fallback: check common install locations */
+#if defined(__APPLE__)
+	/* Homebrew on Apple Silicon */
 	QString brewPath = "/opt/homebrew/bin/llama-cli";
 	if (QFile::exists(brewPath)) {
+		blog(LOG_INFO, "[LlamaRunner] Using Homebrew llama-cli (dev fallback)");
 		return brewPath.toStdString();
 	}
 	
+	/* Homebrew on Intel */
+	QString localPath = "/usr/local/bin/llama-cli";
+	if (QFile::exists(localPath)) {
+		blog(LOG_INFO, "[LlamaRunner] Using /usr/local llama-cli (dev fallback)");
+		return localPath.toStdString();
+	}
+#endif
+	
+	blog(LOG_WARNING, "[LlamaRunner] llama-cli not found - chapter generation unavailable");
 	return "";
 }
 
